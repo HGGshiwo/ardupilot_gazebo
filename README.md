@@ -16,6 +16,17 @@ make -j$(nproc)
 sudo make install
 ```
 
+使用方法:
+```
+<plugin name="gimbal_ros_control" filename="libGimbalSmall2dPlugin.so">
+  <joint>tilt_joint</joint>
+  
+  <rosServiceName>/uav/gimbal/set_angle</rosServiceName>
+  
+  <rosTopicName>/uav/gimbal/pitch_status</rosTopicName>
+</plugin>
+```
+
 ## Requirements :
 Native Ubuntu able to run full 3D graphics.
 Gazebo version 8.x or greater
