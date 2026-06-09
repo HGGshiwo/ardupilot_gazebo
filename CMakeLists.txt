@@ -17,6 +17,10 @@ else()
     message("Gazebo version: ${GAZEBO_VERSION}")
 endif()
 
+find_package(roscpp REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(rsos_msgs REQUIRED)
+
 ###### COMPILE RULES ######
 include(CheckCXXCompilerFlag)
 
@@ -121,10 +125,14 @@ set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${VALID_CXX_FLAGS} ${UNFILTERED_FLAGS}"
 ###########
 
 include_directories(
-        ${PROJECT_SOURCE_DIR}
-        include
-        ${GAZEBO_INCLUDE_DIRS}
-        )
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}         # 🌟 核心：必须包含根目录，否则原作者的 "include/xxx.hh" 会报错
+    ${PROJECT_SOURCE_DIR}/include # 包含 include 目录本身
+    ${GAZEBO_INCLUDE_DIRS}
+    ${roscpp_INCLUDE_DIRS}
+    ${std_msgs_INCLUDE_DIRS}
+    ${rsos_msgs_INCLUDE_DIRS}
+    )
 
 link_libraries(
         ${GAZEBO_LIBRARIES}
@@ -146,11 +154,9 @@ target_link_libraries(ArduCopterIRLockPlugin ${GAZEBO_LIBRARIES})
 add_library(ArduPilotPlugin SHARED src/ArduPilotPlugin.cc)
 target_link_libraries(ArduPilotPlugin ${GAZEBO_LIBRARIES})
 
-if("${GAZEBO_VERSION}" VERSION_LESS "8.0")
-    add_library(GimbalSmall2dPlugin SHARED src/GimbalSmall2dPlugin.cc)
-    target_link_libraries(GimbalSmall2dPlugin ${GAZEBO_LIBRARIES})
-    install(TARGETS GimbalSmall2dPlugin DESTINATION ${GAZEBO_PLUGIN_PATH})
-endif()
+add_library(GimbalSmall2dPlugin SHARED src/GimbalSmall2dPlugin.cc)
+target_link_libraries(GimbalSmall2dPlugin ${GAZEBO_LIBRARIES})
+install(TARGETS GimbalSmall2dPlugin DESTINATION ${GAZEBO_PLUGIN_PATH})
 
 install(TARGETS ArduCopterIRLockPlugin DESTINATION ${GAZEBO_PLUGIN_PATH})
 install(TARGETS ArduPilotPlugin DESTINATION ${GAZEBO_PLUGIN_PATH})

@@ -1,5 +1,21 @@
 # Ardupilot Gazebo plugin 
 
+这不是一个ROS包，编译命令如下（要source了devel/setup.bash，不然找不到RSOS）：
+
+```
+# 1. 创建并进入构建目录
+mkdir build && cd build
+
+# 2. 生成 Makefile (CMake 会自动读取上面 source 的环境变量)
+cmake ..
+
+# 3. 编译源码
+make -j$(nproc)
+
+# 4. 将编译好的插件强行注入到 Gazebo 默认的系统目录
+sudo make install
+```
+
 ## Requirements :
 Native Ubuntu able to run full 3D graphics.
 Gazebo version 8.x or greater

@@ -1,25 +1,18 @@
-/*
- * Copyright (C) 2016 Open Source Robotics Foundation
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
-*/
 #include <string>
 #include <vector>
+#include <mutex>
+#include <thread>
 
-#include "gazebo/common/PID.hh"
-#include "gazebo/physics/physics.hh"
-#include "gazebo/transport/transport.hh"
+#include <gazebo/common/PID.hh>
+#include <gazebo/physics/physics.hh>
+#include <gazebo/gazebo.hh>
+
+// 引入 ROS 核心及消息机制
+#include <ros/ros.h>
+#include <ros/callback_queue.h>
+#include <std_msgs/Float64.h>
+#include <rsos_msgs/SetGimbalAngle.h> // 🌟 自动匹配了你的 rsos_msgs 包
+
 #include "GimbalSmall2dPlugin.hh"
 
 using namespace gazebo;
@@ -27,136 +20,195 @@ using namespace std;
 
 GZ_REGISTER_MODEL_PLUGIN(GimbalSmall2dPlugin)
 
-/// \brief Private data class
 class gazebo::GimbalSmall2dPluginPrivate
 {
-  /// \brief Callback when a command string is received.
-  /// \param[in] _msg Mesage containing the command string
-  public: void OnStringMsg(ConstGzStringPtr &_msg);
+  // 🌟 将析构逻辑移入私有类，这样就不会和外部 .hh 冲突，且能安全释放线程
+  public: ~GimbalSmall2dPluginPrivate()
+  {
+    if (rosNode) {
+      rosNode->shutdown();
+    }
+    if (rosQueueThread.joinable()) {
+      rosQueueThread.join();
+    }
+  }
 
-  /// \brief A list of event connections
+  // 🌟 将这两个内部函数声明移入私有类
+  public: void QueueThread();
+  public: bool OnServiceCall(rsos_msgs::SetGimbalAngle::Request &req,
+                              rsos_msgs::SetGimbalAngle::Response &res);
+
   public: std::vector<event::ConnectionPtr> connections;
-
-  /// \brief Subscriber to the gimbal command topic
-  public: transport::SubscriberPtr sub;
-
-  /// \brief Publisher to the gimbal status topic
-  public: transport::PublisherPtr pub;
-
-  /// \brief Parent model of this plugin
   public: physics::ModelPtr model;
-
-  /// \brief Joint for tilting the gimbal
   public: physics::JointPtr tiltJoint;
-
-  /// \brief Command that updates the gimbal tilt angle
-  public: double command = IGN_PI_2;
-
-  /// \brief Pointer to the transport node
-  public: transport::NodePtr node;
-
-  /// \brief PID controller for the gimbal
   public: common::PID pid;
-
-  /// \brief Last update sim time
   public: common::Time lastUpdateTime;
+
+  // --- ROS 核心变量 ---
+  public: unique_ptr<ros::NodeHandle> rosNode;
+  public: ros::ServiceServer rosSrv;
+  public: ros::Publisher rosPub;
+  public: ros::CallbackQueue rosQueue;
+  public: std::thread rosQueueThread;
+  public: std::mutex mutex;
+
+  // --- 配置参数与状态控制 ---
+  public: std::string rosServiceName = "set_gimbal_angle";
+  public: std::string rosTopicName = "gimbal_pitch";
+  public: std::string jointName = "tilt_joint";
+  
+  public: std::string currentMode = "body"; 
+  public: double targetAngleDeg = 0.0;       
+  public: common::Time lastPubTime;
 };
 
-/////////////////////////////////////////////////
 GimbalSmall2dPlugin::GimbalSmall2dPlugin()
   : dataPtr(new GimbalSmall2dPluginPrivate)
 {
-  this->dataPtr->pid.Init(1, 0, 0, 0, 0, 1.0, -1.0);
+  this->dataPtr->pid.Init(10.0, 0.1, 1.0, 10.0, -10.0, 10.0, -10.0);
 }
 
-/////////////////////////////////////////////////
-void GimbalSmall2dPlugin::Load(physics::ModelPtr _model,
-  sdf::ElementPtr _sdf)
+// 🌟 删除了原本引起冲突的 GimbalSmall2dPlugin::~GimbalSmall2dPlugin() 外部实现
+
+void GimbalSmall2dPlugin::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf)
 {
   this->dataPtr->model = _model;
 
-  std::string jointName = "tilt_joint";
   if (_sdf->HasElement("joint"))
-  {
-    jointName = _sdf->Get<std::string>("joint");
-  }
-  this->dataPtr->tiltJoint = this->dataPtr->model->GetJoint(jointName);
+    this->dataPtr->jointName = _sdf->Get<std::string>("joint");
+    
+  if (_sdf->HasElement("rosServiceName"))
+    this->dataPtr->rosServiceName = _sdf->Get<std::string>("rosServiceName");
+
+  if (_sdf->HasElement("rosTopicName"))
+    this->dataPtr->rosTopicName = _sdf->Get<std::string>("rosTopicName");
+
+  this->dataPtr->tiltJoint = this->dataPtr->model->GetJoint(this->dataPtr->jointName);
   if (!this->dataPtr->tiltJoint)
   {
-    std::string scopedJointName = _model->GetScopedName() + "::" + jointName;
-    gzwarn << "joint [" << jointName
-           << "] not found, trying again with scoped joint name ["
-           << scopedJointName << "]\n";
+    std::string scopedJointName = _model->GetScopedName() + "::" + this->dataPtr->jointName;
     this->dataPtr->tiltJoint = this->dataPtr->model->GetJoint(scopedJointName);
   }
   if (!this->dataPtr->tiltJoint)
   {
-    gzerr << "GimbalSmall2dPlugin::Load ERROR! Can't get joint '"
-          << jointName << "' " << endl;
+    gzerr << "GimbalSmall2dPlugin::Load ERROR! Can't find joint: " << this->dataPtr->jointName << endl;
+    return;
   }
+
+  if (!ros::isInitialized())
+  {
+    int argc = 0;
+    char** argv = NULL;
+    // 🌟 修复拼写错误：NoSigHandler -> NoSigintHandler
+    ros::init(argc, argv, "gazebo_gimbal_plugin", ros::init_options::NoSigintHandler);
+  }
+
+  this->dataPtr->rosNode.reset(new ros::NodeHandle("~"));
+
+  // 🌟 改变绑定目标：指向 GimbalSmall2dPluginPrivate::OnServiceCall
+  ros::AdvertiseServiceOptions aso =
+    ros::AdvertiseServiceOptions::create<rsos_msgs::SetGimbalAngle>(
+      this->dataPtr->rosServiceName,
+      boost::bind(&GimbalSmall2dPluginPrivate::OnServiceCall, this->dataPtr.get(), _1, _2),
+      ros::VoidPtr(),
+      &this->dataPtr->rosQueue);
+  this->dataPtr->rosSrv = this->dataPtr->rosNode->advertiseService(aso);
+
+  this->dataPtr->rosPub = this->dataPtr->rosNode->advertise<std_msgs::Float64>(this->dataPtr->rosTopicName, 1);
+
+  // 🌟 改变绑定目标：指向 GimbalSmall2dPluginPrivate::QueueThread
+  this->dataPtr->rosQueueThread = std::thread(std::bind(&GimbalSmall2dPluginPrivate::QueueThread, this->dataPtr.get()));
 }
 
-/////////////////////////////////////////////////
 void GimbalSmall2dPlugin::Init()
 {
-  this->dataPtr->node = transport::NodePtr(new transport::Node());
-  this->dataPtr->node->Init(this->dataPtr->model->GetWorld()->GetName());
-
-  this->dataPtr->lastUpdateTime =
-    this->dataPtr->model->GetWorld()->GetSimTime();
-
-  std::string topic = std::string("~/") +  this->dataPtr->model->GetName() +
-    "/gimbal_tilt_cmd";
-  this->dataPtr->sub = this->dataPtr->node->Subscribe(topic,
-      &GimbalSmall2dPluginPrivate::OnStringMsg, this->dataPtr.get());
+  this->dataPtr->lastUpdateTime = this->dataPtr->model->GetWorld()->SimTime();
+  this->dataPtr->lastPubTime = this->dataPtr->model->GetWorld()->SimTime();
 
   this->dataPtr->connections.push_back(event::Events::ConnectWorldUpdateBegin(
-          std::bind(&GimbalSmall2dPlugin::OnUpdate, this)));
-
-  topic = std::string("~/") +
-    this->dataPtr->model->GetName() + "/gimbal_tilt_status";
-
-  this->dataPtr->pub =
-    this->dataPtr->node->Advertise<gazebo::msgs::GzString>(topic);
+      std::bind(&GimbalSmall2dPlugin::OnUpdate, this)));
 }
 
-/////////////////////////////////////////////////
-void GimbalSmall2dPluginPrivate::OnStringMsg(ConstGzStringPtr &_msg)
+// 🌟 实现归属于 GimbalSmall2dPluginPrivate
+void GimbalSmall2dPluginPrivate::QueueThread()
 {
-  this->command = atof(_msg->data().c_str());
+  static const double timeout = 0.01;
+  while (this->rosNode->ok())
+  {
+    this->rosQueue.callAvailable(ros::WallDuration(timeout));
+  }
 }
 
-/////////////////////////////////////////////////
+// 🌟 实现归属于 GimbalSmall2dPluginPrivate
+bool GimbalSmall2dPluginPrivate::OnServiceCall(rsos_msgs::SetGimbalAngle::Request &req,
+                                               rsos_msgs::SetGimbalAngle::Response &res)
+{
+  if (req.mode != "abs" && req.mode != "body")
+  {
+    res.success = false;
+    res.message = "Error: Invalid mode! Supported modes: 'abs' or 'body'.";
+    return true;
+  }
+
+  std::lock_guard<std::mutex> lock(this->mutex);
+  this->currentMode = req.mode;
+  this->targetAngleDeg = req.angle;
+
+  res.success = true;
+  res.message = "Gimbal command updated target to " + to_string(req.angle) + " (" + req.mode + ")";
+  return true;
+}
+
 void GimbalSmall2dPlugin::OnUpdate()
 {
-  if (!this->dataPtr->tiltJoint)
-    return;
+  if (!this->dataPtr->tiltJoint) return;
 
-  double angle = this->dataPtr->tiltJoint->GetAngle(0).Radian();
-
-  common::Time time = this->dataPtr->model->GetWorld()->GetSimTime();
-  if (time < this->dataPtr->lastUpdateTime)
+  common::Time time = this->dataPtr->model->GetWorld()->SimTime();
+  if (time <= this->dataPtr->lastUpdateTime)
   {
     this->dataPtr->lastUpdateTime = time;
     return;
   }
-  else if (time > this->dataPtr->lastUpdateTime)
+  double dt = (time - this->dataPtr->lastUpdateTime).Double();
+  this->dataPtr->lastUpdateTime = time;
+
+  ignition::math::Pose3d worldPose = this->dataPtr->model->WorldPose();
+  double vehiclePitchRad = worldPose.Rot().Pitch(); 
+
+  double currentJointRad = this->dataPtr->tiltJoint->Position(0);
+  double targetJointRad = 0.0;
+  
+  std::lock_guard<std::mutex> lock(this->dataPtr->mutex);
+  double targetAngleRad = this->dataPtr->targetAngleDeg * M_PI / 180.0;
+
+  if (this->dataPtr->currentMode == "body")
   {
-    double dt = (this->dataPtr->lastUpdateTime - time).Double();
-    double error = angle - this->dataPtr->command;
-    double force = this->dataPtr->pid.Update(error, dt);
-    this->dataPtr->tiltJoint->SetForce(0, force);
-    this->dataPtr->lastUpdateTime = time;
+    targetJointRad = targetAngleRad;
+  }
+  else if (this->dataPtr->currentMode == "abs")
+  {
+    targetJointRad = targetAngleRad + vehiclePitchRad;
   }
 
-  static int i = 1000;
-  if (++i > 100)
+  double error = currentJointRad - targetJointRad;
+  double force = this->dataPtr->pid.Update(error, dt);
+  this->dataPtr->tiltJoint->SetForce(0, force);
+
+  if ((time - this->dataPtr->lastPubTime).Double() >= 0.02)
   {
-    i = 0;
-    std::stringstream ss;
-    ss << angle;
-    gazebo::msgs::GzString m;
-    m.set_data(ss.str());
-    this->dataPtr->pub->Publish(m);
+    std_msgs::Float64 pitchMsg;
+    
+    if (this->dataPtr->currentMode == "body")
+    {
+      pitchMsg.data = - (currentJointRad * 180.0 / M_PI);
+    }
+    else if (this->dataPtr->currentMode == "abs")
+    {
+      double currentAbsDownwardRad = currentJointRad - vehiclePitchRad;
+      pitchMsg.data = - (currentAbsDownwardRad * 180.0 / M_PI);
+    }
+
+    this->dataPtr->rosPub.publish(pitchMsg);
+    this->dataPtr->lastPubTime = time;
   }
 }
